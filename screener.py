@@ -851,15 +851,36 @@ def main() -> None:
 
     supabase = get_supabase_client()
 
-    # バッチ開始ログを記録
-    supabase.table("batch_logs").upsert({
-        "batch_date": str(batch_date),
-        "started_at": datetime.utcnow().isoformat(),
-        "status":     "running",
-    }).execute()
+    # バッチ開始ログを記録（安全に挿入→衝突時は更新）
+    started_at = datetime.utcnow().isoformat()
+    try:
+        supabase.table("batch_logs").insert({
+            "batch_date": str(batch_date),
+            "started_at": started_at,
+            "status":     "running",
+        }).execute()
+    except Exception as e:
+        # 既に同日付の行がある（重複キー）の場合は更新にフォールバック
+        if "duplicate key" in str(e) or "23505" in str(e):
+            supabase.table("batch_logs").update({
+                "started_at": started_at,
+                "status":     "running",
+            }).eq("batch_date", str(batch_date)).execute()
+        else:
+            raise
 
     try:
         # ── データ取得 ──
+        # tickers.csv の存在確認
+        if not os.path.exists(TICKERS_CSV):
+            log.error(f"{TICKERS_CSV} not found; aborting batch.")
+            supabase.table("batch_logs").update({
+                "finished_at": datetime.utcnow().isoformat(),
+                "status": "failed",
+                "error_message": f"{TICKERS_CSV} not found",
+            }).eq("batch_date", str(batch_date)).execute()
+            return
+
         tickers  = load_tickers(TICKERS_CSV)
         all_data = download_history(tickers)
 
@@ -878,27 +899,25 @@ def main() -> None:
         # ── 通知 ──
         notify_discord(s3_passed)
 
-        # バッチ完了ログ
-        supabase.table("batch_logs").upsert({
-            "batch_date":    str(batch_date),
+        # バッチ完了ログ: 既存行を更新して上書き
+        supabase.table("batch_logs").update({
             "finished_at":   datetime.utcnow().isoformat(),
             "status":        "success",
             "total_tickers": len(tickers),
             "stage1_passed": len(s1_passed),
             "stage2_passed": len(s2_passed),
             "stage3_passed": len(s3_passed),
-        }).execute()
+        }).eq("batch_date", str(batch_date)).execute()
 
         log.info(f"=== Batch complete. Final candidates: {len(s3_passed)} ===")
 
     except Exception as e:
         log.exception(f"Batch failed: {e}")
-        supabase.table("batch_logs").upsert({
-            "batch_date":    str(batch_date),
+        supabase.table("batch_logs").update({
             "finished_at":   datetime.utcnow().isoformat(),
             "status":        "failed",
             "error_message": str(e),
-        }).execute()
+        }).eq("batch_date", str(batch_date)).execute()
         raise
 
 
