@@ -1,0 +1,180 @@
+# =============================================================
+# .github/workflows/screener.yml
+# カップウィズハンドル スクリーナー: 日次バッチ自動実行
+#
+# 実行タイミング:
+#   - 平日 (月〜金) の 07:00 UTC = 日本時間 16:00 JST
+#     米国市場は同日夜に開くため、前日終値での分析を実施
+#   - 手動トリガー (workflow_dispatch) で任意実行も可能
+# =============================================================
+
+name: Cup with Handle Daily Screener
+
+on:
+  schedule:
+    # UTC 07:00 = JST 16:00 (月〜金)
+    - cron: "0 7 * * 1-5"
+
+  # 手動実行 (GitHub UI の "Run workflow" ボタン)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (Supabaseへの書き込みをスキップ)"
+        required: false
+        default: "false"
+        type: boolean
+
+# 同一ワークフローの並列実行を防ぐ (前のバッチが遅延した場合に備える)
+concurrency:
+  group: screener-daily
+  cancel-in-progress: false
+
+jobs:
+  # ────────────────────────────────────────────
+  # Job 1: スクリーニングバッチ実行
+  # ────────────────────────────────────────────
+  run-screener:
+    name: Run Cup-with-Handle Screener
+    runs-on: ubuntu-latest
+
+    # ジョブ全体のタイムアウト: 60分
+    # (約4000銘柄のダウンロード + 解析に最大30~40分かかる想定)
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. リポジトリをチェックアウト ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python 環境セットアップ ──
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # pip キャッシュで2回目以降のインストールを高速化
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      # ── 3. 依存パッケージのインストール ──
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. 学習済みモデルのキャッシュ復元 ──
+      # model.pkl はリポジトリに直接コミットしても良いが、
+      # 大容量になる場合は GitHub Cache or Artifact で管理する
+      - name: Restore LightGBM model cache
+        uses: actions/cache@v4
+        with:
+          path: model.pkl
+          key: lgbm-model-${{ hashFiles('train_model.py') }}
+          restore-keys: |
+            lgbm-model-
+
+      # ── 5. スクリーナー本体を実行 ──
+      - name: Run screener
+        env:
+          # ── Supabase ──
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          # ── 通知 ──
+          DISCORD_WEBHOOK_URL:       ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID:              ${{ secrets.LINE_USER_ID }}
+
+          # ── オプション ──
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+
+          # ── yfinance レート制限対策 ──
+          # User-Agent を設定してブロックを回避
+          YFINANCE_USER_AGENT: "Mozilla/5.0 (compatible; ScreenerBot/1.0)"
+
+        run: |
+          echo "=== Starting screener at $(date -u) UTC ==="
+          python screener.py
+          echo "=== Screener finished at $(date -u) UTC ==="
+
+      # ── 6. ログをアーティファクトとして保存 ──
+      # デバッグ時に GitHub UI からダウンロード可能
+      - name: Upload log artifact
+        if: always()   # 失敗時も保存する
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-log-${{ github.run_id }}
+          path: screener.log
+          retention-days: 7
+
+  # ────────────────────────────────────────────
+  # Job 2: モデルの週次再学習 (土曜 00:00 UTC に実行)
+  # スクリーニングジョブとは独立したジョブとして定義
+  # ────────────────────────────────────────────
+  retrain-model:
+    name: Weekly LightGBM Retrain
+    runs-on: ubuntu-latest
+    # 土曜 00:00 UTC のスケジュールはトリガー条件で制御
+    # (schedule で別途定義するか、if 条件で曜日チェックする)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false'
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run model training
+        env:
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python train_model.py
+
+      # 再学習したモデルをキャッシュに保存
+      - name: Save LightGBM model cache
+        uses: actions/cache@v4
+        with:
+          path: model.pkl
+          key: lgbm-model-${{ hashFiles('train_model.py') }}
+
+---
+# =============================================================
+# requirements.txt (参考)
+# =============================================================
+# yfinance>=0.2.40
+# pandas>=2.2.0
+# pandas-ta>=0.3.14b
+# numpy>=1.26.0
+# lightgbm>=4.3.0
+# supabase>=2.4.0
+# requests>=2.31.0
+# scikit-learn>=1.4.0   # モデル評価・前処理用
+# joblib>=1.3.0         # pickle の代替 (モデル保存)
+#
+# =============================================================
+# secrets の設定方法 (GitHub リポジトリ → Settings → Secrets)
+# =============================================================
+#
+# SUPABASE_URL
+#   Supabase プロジェクトの API URL
+#   例: https://xxxxxxxxxxxx.supabase.co
+#
+# SUPABASE_SERVICE_ROLE_KEY
+#   Supabase の service_role キー (書き込み権限あり)
+#   ⚠️ anon キーではなく service_role キーを使うこと
+#
+# DISCORD_WEBHOOK_URL
+#   Discord サーバー → チャンネル設定 → 連携サービス → Webhook で取得
+#   例: https://discord.com/api/webhooks/xxxxx/yyyyy
+#
+# LINE_CHANNEL_ACCESS_TOKEN
+#   LINE Developers → Messaging API → チャンネルアクセストークン
+#
+# LINE_USER_ID
+#   通知先の LINE ユーザー ID
+#   (LINE Official Account Manager → ユーザー管理で確認)
